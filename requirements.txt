@@ -1,0 +1,5 @@
+aiofiles==0.6.0
+aiogram==2.11.2
+aiohttp==3.7.3
+asyncpg==0.21.0
+loguru==0.5.3
