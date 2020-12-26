@@ -1,5 +1,6 @@
 # chaos_bot
 ### Chaos
+Python 3.8.6
 
 1) Запускаем команду pip install -r requirements.txt
 2) Создаем телеграм бота
