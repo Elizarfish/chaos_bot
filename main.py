@@ -15,13 +15,14 @@ from datetime import datetime
 
 from loguru import logger
 from aiogram import Bot, Dispatcher, types
+from aiogram.utils.exceptions import BadRequest as AioGramBadRequest
 
 
 # Config DB
 DATABASE = ""
 USER = ""
 PASSWORD = ""
-HOST = "127.0.0.1"
+HOST = "localhost"
 PORT = "5432"
 
 # ID юзера с которым будет связь
@@ -36,6 +37,19 @@ CACHE_PATH = os.path.abspath('./.cache/')
 ARCHIVES_PATH = os.path.join(CACHE_PATH, 'archives/')
 # Текстовые документы с доменами
 DOMAINS_PATH = os.path.join(CACHE_PATH, 'domains/')
+
+BYPASS = [
+    'Telenet',
+    'Shopify',
+    'Verizona Media',
+    'Cisco Meraki',
+    'Alibaba',
+    'stanford',
+    'Microsoft Online Services',
+    'AT&T',
+    'MTN Group',
+    'WP Engine'
+]
 
 # Создаем папки, если их нет
 if not os.path.exists(CACHE_PATH):
@@ -81,9 +95,9 @@ async def downloadPrograms(data):
         data['last_updated'][:-4],
         '%Y-%m-%dT%H:%M:%S.%f'
     )
+    data['name'] = data['name'].lower()
 
     record_program = await pool.fetchrow('SELECT * FROM bg_programs WHERE name = ($1);', data['name'])
-
     if record_program is None:
         # Если записи программы нет - добавляем и достаем запись
         await pool.execute(
@@ -93,7 +107,7 @@ async def downloadPrograms(data):
         record_program = await pool.fetchrow('SELECT * FROM bg_programs WHERE name = ($1);', data['name'])
     else:
         # В случае отсутствия обновлений - выходим
-        if data['change'] == 0:
+        if data['change'] == 0 or record_program.get('last_updated') >= data['last_updated']:
             return
         else:
             # Изменяем время обновления
@@ -183,28 +197,8 @@ async def downloadPrograms(data):
 
 
 @logger.catch
-async def getProgramsList():
-    ''' Вовзвращает список программ '''
-    async with aiohttp.ClientSession() as session:
-        async with session.get('https://chaos-data.projectdiscovery.io/index.json') as response:
-            content = await response.text()
-    logger.info('Взят список программ')
-    return json.loads(content)
-
-
-@logger.catch
-async def main():
-    global pool, main_bot
-
-    pool = await asyncpg.create_pool(
-        database=DATABASE, user=USER,
-        password=PASSWORD, host=HOST,
-        port=PORT
-    )
-    main_bot = Bot(token=bot_token, loop=loop)
-
-    if namespace.mode == "create":
-        # Создаём таблицы в бд
+async def createDb():
+    async with await asyncpg.create_pool(database=DATABASE, user=USER, password=PASSWORD, host=HOST, port=PORT) as pool:
         async with pool.acquire() as con:
             async with con.transaction():
                 await con.execute('''
@@ -225,50 +219,111 @@ async def main():
                 ''')
                 logger.info('Создана таблица "bg_domains"')
 
+
+@logger.catch
+async def getProgramsList():
+    ''' Вовзвращает список программ '''
+    async with aiohttp.ClientSession() as session:
+        async with session.get('https://chaos-data.projectdiscovery.io/index.json') as response:
+            content = await response.text()
+    logger.info('Взят список программ')
+    return json.loads(content)
+
+
+@logger.catch
+async def main():
+    global pool, main_bot
+
+    main_bot = Bot(token=bot_token, loop=loop)
+
+    if namespace.mode == "create":
+        await createDb()
+
     while True:
         programs_list = await getProgramsList()
-        pathes_to_archives = [downloadPrograms(program) for program in programs_list]
-        records, pending = await asyncio.wait(pathes_to_archives)
+        pool = await asyncpg.create_pool(database=DATABASE, user=USER, password=PASSWORD, host=HOST, port=PORT)
+        domains_records = [downloadPrograms(program) for program in programs_list if program['name'] not in BYPASS]
+        records = await asyncio.gather(*domains_records)
+        await pool.close()
 
-        async with aiofiles.open('new_domains.txt', 'w') as file:
+
+        async with aiofiles.open('new_domains.txt', 'w', encoding='utf-8') as file:
             domains = list()
             for record in records:
-                domains.extend([result_domains.get('domain') for result_domains in record.result()])
+                if record is None:
+                    continue
+                domains.extend([result_domains.get('domain') for result_domains in record if result_domains is not None])
             await file.write("\n".join(domains))
 
-        await main_bot.send_document(admin_id, types.InputFile('new_domains.txt'))
+        try:
+            await main_bot.send_document(admin_id, types.InputFile('new_domains.txt'))
+            logger.info('Новые домены отправлены пользователю {admin_id}', admin_id=admin_id)
+        except AioGramBadRequest:
+            await main_bot.send_message(admin_id, 'Новых доменов - нет')
+            logger.info('Новых доменов - нет', admin_id=admin_id)
+
         os.remove('new_domains.txt')
-        logger.info('Новые домены отправлены пользователю {admin_id}', admin_id=admin_id)
 
         if namespace.mode == "create":
             logger.info('Все основные данные добавлены в базу данных')
             exit()
+
         time.sleep(18000)  # 5 часов
 
 
 async def programInfo(event: types.Message):
     ''' Отправляет сведения о программе '''
     msg = event.text
-    program_name = " ".join(msg.split(' ')[1:])
+    command_parts = msg.split(' ')
+    if len(command_parts) <=1:
+        logger.info('Сведения программы не были отправлены пользователю {admin_id}. \
+                    Не правильный ввод комманды. Вводмая комманда: {text}',
+                    admin_id=admin_id, text=event.text)
+        await event.answer("Не правильная комманда.")
+        return
+    program_name = " ".join(command_parts[1:]).lower()
+
+
+    pool_bot = await asyncpg.create_pool(database=DATABASE, user=USER, password=PASSWORD, host=HOST, port=PORT)
     program = await pool_bot.fetchrow('SELECT * FROM bg_programs WHERE name=$1;', program_name)
+    if program is None:
+        logger.info('Сведения программы не были отправлены пользователю {admin_id}. \
+                    Не найдена программа ({name}).',
+                    admin_id=admin_id, name=program_name)
+        await event.answer("Программа не найдена.")
+        return
+
     await event.answer(
         "Название: %s\nСсылка: %s\nДата последнего обновления: %s" % \
         (program.get('name'), program.get('program_url'), str(program.get('last_updated')))
     )
-    logger.info('Сведения программы {program} отправлены пользователю {admin_id}',
-                admin_id=admin_id,
-                program=program_name)
+    await pool_bot.close()
 
 
 async def programDomains(event: types.Message):
     ''' Отправляет список доменов программы '''
     msg = event.text
-    program_name = " ".join(msg.split(' ')[1:])
+    command_parts = msg.split(' ')
+    if len(command_parts) <= 1:
+        logger.info('Сведения программы не были отправлены пользователю {admin_id}. \
+                        Не правильный ввод комманды. Вводмая комманда: {text}',
+                    admin_id=admin_id, text=event.text)
+        await event.answer("Не правильная комманда.")
+        return
+    program_name = " ".join(command_parts[1:]).lower()
+
+    pool_bot = await asyncpg.create_pool(database=DATABASE, user=USER, password=PASSWORD, host=HOST, port=PORT)
     program = await pool_bot.fetchrow('SELECT * FROM bg_programs WHERE name=$1;', program_name)
+    if program is None:
+        logger.info('Сведения программы не были отправлены пользователю {admin_id}. \
+                           Не найдена программа ({name}).',
+                    admin_id=admin_id, name=program_name)
+        await event.answer("Программа не найдена.")
+        return
     domains = await pool_bot.fetch('SELECT domain FROM bg_domains WHERE bg_programs_id=$1', program.get('id'))
 
     file_name = '%s.txt' % program_name
-    async with aiofiles.open(file_name, 'w') as file:
+    async with aiofiles.open(file_name, 'w', encoding='utf-8') as file:
         await file.write('\n'.join([domain.get('domain') for domain in domains]))
 
     await event.reply_document(document=types.InputFile(file_name))
@@ -278,15 +333,12 @@ async def programDomains(event: types.Message):
                 admin_id=admin_id,
                 program=program_name)
 
+    await pool_bot.close()
+
 
 async def tgBot():
     global pool_bot
     global bot
-    pool_bot = await asyncpg.create_pool(
-        database=DATABASE, user=USER,
-        password=PASSWORD, host=HOST,
-        port=PORT
-    )
 
     bot = Bot(token=bot_token, loop=loop_bot)
 
