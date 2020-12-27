@@ -25,8 +25,8 @@ PASSWORD = ""
 HOST = "localhost"
 PORT = "5432"
 
-# ID юзера с которым будет связь
-admin_id = ""
+# ID юзеров с которыми будет связь
+admin_ids = [123, 456]
 
 # Токен бота
 bot_token = ""
@@ -41,7 +41,7 @@ DOMAINS_PATH = os.path.join(CACHE_PATH, 'domains/')
 BYPASS = [
     'Telenet',
     'Shopify',
-    'Verizona Media',
+    'Verizon Media',
     'Cisco Meraki',
     'Alibaba',
     'stanford',
@@ -64,7 +64,7 @@ else:
 
 logger.add(
     "fileLog.log",
-    rotation="0.5 GB",
+    rotation="0.1 GB",
     compression="tar.gz",
     format="{time:YYYY-MM-DD at HH:mm:ss} | {level} | {message}"
 )
@@ -130,64 +130,67 @@ async def downloadPrograms(data):
         archive.extractall(program_domains_path)
 
     # Начинаем парсить файлы в директории
-    domains = list()
+    if namespace.mode == "create":
+        domains = list()
+    else:
+        domains = set()
     names_files_domains = os.listdir(program_domains_path)
     for name_file_domain in names_files_domains:
         # Добавляем домен верхнего уровня (в названии файла)
         domain = ".".join(name_file_domain.split('.')[0:-1])
-        domains.append("\t".join((
-            domain,
-            str(data['last_updated']),
-            str(record_program.get('id'))
-        )))
+        if namespace.mode == "create":
+            domains.append("\t".join((
+                domain,
+                str(data['last_updated']),
+                str(record_program.get('id'))
+            )))
+        else:
+            domains.add(domain)
 
         # Добавляем сабдомены из файла
         file_subdomain_path = os.path.join(program_domains_path, name_file_domain)
-        async with aiofiles.open(file_subdomain_path, 'r') as file_subdomain:
+        async with aiofiles.open(file_subdomain_path, 'r', encoding='utf-8') as file_subdomain:
             async for subdomain in file_subdomain:
                 subdomain = subdomain[:-1]  # Убираем символ \n
-                domains.append("\t".join((
-                    subdomain,
-                    str(data['last_updated']),
-                    str(record_program.get('id'))
-                )))
-
+                if namespace.mode == "create":
+                    domains.append("\t".join((
+                        subdomain,
+                        str(data['last_updated']),
+                        str(record_program.get('id'))
+                    )))
+                else:
+                    domains.add(subdomain)
     for file_domains in names_files_domains:
         os.remove(os.path.join(program_domains_path, file_domains))
     os.rmdir(program_domains_path)
     os.remove(path_to_archive)
 
     @logger.catch
-    async def import_data(connection):
+    async def import_data(connection, new_domains_add):
         # Создаем в памяти файл, в который будем лить домены
         f = io.BytesIO()
-        f.write('\n'.join(domains).encode('utf-8'))
+        f.write('\n'.join(new_domains_add).encode('utf-8'))
         f.seek(0)
 
         # Импортируем в бд созданный ранее файл
         res = await connection.copy_to_table(
-            table_name, source=f,
+            "bg_domains", source=f,
             columns=['domain', 'date_add', 'bg_programs_id']
         )
 
     if namespace.mode != "create":
-        table_name = "tmp_%s" % ''.join(c for c in record_program.get('name').lower() if c.isalpha())
         async with pool.acquire() as con:
-            await con.execute(
-                "CREATE TEMP TABLE %s AS SELECT * FROM bg_domains LIMIT 0;" % table_name
-            )
-
-            await import_data(con)
-
-            count_insert = await con.execute(
-                'INSERT INTO bg_domains(domain, date_add, bg_programs_id) \
-                SELECT {}.domain, {}.date_add, {}.bg_programs_id FROM {} \
-                WHERE {}.domain NOT IN(SELECT domain FROM bg_domains);'.format(*(table_name, ) * 5)
-            )
+            bd_domains = await con.fetch('SELECT domain FROM bg_domains WHERE bg_programs_id=$1;', record_program.get('id'))
+            bd_domains = {bd_domain.get('domain') for bd_domain in bd_domains}
+            new_domains = ["\t".join((
+                new_domain,
+                str(data['last_updated']),
+                str(record_program.get('id'))
+            )) for new_domain in domains.difference(bd_domains)]
+            await import_data(con, new_domains)
     else:
-        table_name = "bg_domains"
         async with pool.acquire() as con:
-            await import_data(con)
+            await import_data(con, domains)
 
     # Возвращаем добавленные домены
     return await pool.fetch(
@@ -256,11 +259,11 @@ async def main():
             await file.write("\n".join(domains))
 
         try:
-            await main_bot.send_document(admin_id, types.InputFile('new_domains.txt'))
-            logger.info('Новые домены отправлены пользователю {admin_id}', admin_id=admin_id)
+            for admin_id in admin_ids:
+                await main_bot.send_document(str(admin_id), types.InputFile('new_domains.txt'))
+                logger.info('Новые домены отправлены пользователю {admin_id}', admin_id=admin_id)
         except AioGramBadRequest:
-            await main_bot.send_message(admin_id, 'Новых доменов - нет')
-            logger.info('Новых доменов - нет', admin_id=admin_id)
+            logger.info('Новых доменов - нет')
 
         os.remove('new_domains.txt')
 
@@ -268,17 +271,19 @@ async def main():
             logger.info('Все основные данные добавлены в базу данных')
             exit()
 
-        time.sleep(18000)  # 5 часов
+        time.sleep(1800)  # 5 часов
 
 
 async def programInfo(event: types.Message):
     ''' Отправляет сведения о программе '''
     msg = event.text
+    user_id = event.from_user['id']
+    if user_id not in admin_ids:
+        return
     command_parts = msg.split(' ')
     if len(command_parts) <=1:
-        logger.info('Сведения программы не были отправлены пользователю {admin_id}. \
-                    Не правильный ввод комманды. Вводмая комманда: {text}',
-                    admin_id=admin_id, text=event.text)
+        logger.info('Сведения программы не были отправлены пользователю {user_id}. Не правильный ввод комманды. Вводмая комманда: {text}',
+                    user_id=user_id, text=event.text)
         await event.answer("Не правильная комманда.")
         return
     program_name = " ".join(command_parts[1:]).lower()
@@ -287,9 +292,8 @@ async def programInfo(event: types.Message):
     pool_bot = await asyncpg.create_pool(database=DATABASE, user=USER, password=PASSWORD, host=HOST, port=PORT)
     program = await pool_bot.fetchrow('SELECT * FROM bg_programs WHERE name=$1;', program_name)
     if program is None:
-        logger.info('Сведения программы не были отправлены пользователю {admin_id}. \
-                    Не найдена программа ({name}).',
-                    admin_id=admin_id, name=program_name)
+        logger.info('Сведения программы не были отправлены пользователю {user_id}. Не найдена программа ({name}).',
+                    user_id=user_id, name=program_name)
         await event.answer("Программа не найдена.")
         return
 
@@ -303,11 +307,14 @@ async def programInfo(event: types.Message):
 async def programDomains(event: types.Message):
     ''' Отправляет список доменов программы '''
     msg = event.text
+    user_id = event.from_user['id']
+    if user_id not in admin_ids:
+        return
     command_parts = msg.split(' ')
     if len(command_parts) <= 1:
-        logger.info('Сведения программы не были отправлены пользователю {admin_id}. \
+        logger.info('Сведения программы не были отправлены пользователю {user_id}. \
                         Не правильный ввод комманды. Вводмая комманда: {text}',
-                    admin_id=admin_id, text=event.text)
+                    user_id=user_id, text=event.text)
         await event.answer("Не правильная комманда.")
         return
     program_name = " ".join(command_parts[1:]).lower()
@@ -315,9 +322,9 @@ async def programDomains(event: types.Message):
     pool_bot = await asyncpg.create_pool(database=DATABASE, user=USER, password=PASSWORD, host=HOST, port=PORT)
     program = await pool_bot.fetchrow('SELECT * FROM bg_programs WHERE name=$1;', program_name)
     if program is None:
-        logger.info('Сведения программы не были отправлены пользователю {admin_id}. \
+        logger.info('Сведения программы не были отправлены пользователю {user_id}. \
                            Не найдена программа ({name}).',
-                    admin_id=admin_id, name=program_name)
+                    user_id=user_id, name=program_name)
         await event.answer("Программа не найдена.")
         return
     domains = await pool_bot.fetch('SELECT domain FROM bg_domains WHERE bg_programs_id=$1', program.get('id'))
@@ -329,8 +336,8 @@ async def programDomains(event: types.Message):
     await event.reply_document(document=types.InputFile(file_name))
 
     os.remove(file_name)
-    logger.info('Список доменов программы {program} отправлен пользователю {admin_id}',
-                admin_id=admin_id,
+    logger.info('Список доменов программы {program} отправлен пользователю {user_id}',
+                user_id=user_id,
                 program=program_name)
 
     await pool_bot.close()
@@ -367,5 +374,4 @@ if __name__ == "__main__":
 
     asyncio.run_coroutine_threadsafe(main(), loop)
     asyncio.run_coroutine_threadsafe(tgBot(), loop_bot)
-
 
