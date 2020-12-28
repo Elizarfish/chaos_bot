@@ -279,6 +279,7 @@ async def programInfo(event: types.Message):
     msg = event.text
     user_id = event.from_user['id']
     if user_id not in admin_ids:
+        await event.answer("ты не админ")
         return
     command_parts = msg.split(' ')
     if len(command_parts) <=1:
@@ -374,4 +375,5 @@ if __name__ == "__main__":
 
     asyncio.run_coroutine_threadsafe(main(), loop)
     asyncio.run_coroutine_threadsafe(tgBot(), loop_bot)
+
 
